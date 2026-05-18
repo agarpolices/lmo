@@ -1,0 +1,27 @@
+{
+  "name": "agma-bot",
+  "version": "2.0.0",
+  "description": "Agma.io bot system with WebSocket control panel",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "Police",
+  "license": "ISC",
+  "dependencies": {
+    "@zennolab_com/capmonstercloud-client": "^2.6.1",
+    "cors": "^2.8.6",
+    "cycletls": "^2.0.5",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "https-proxy-agent": "^9.0.0",
+    "node-tls-client": "^2.1.0",
+    "puppeteer": "^24.42.0",
+    "puppeteer-real-browser": "^1.4.4",
+    "socks-proxy-agent": "^10.0.0",
+    "wreq-js": "^2.3.0",
+    "ws": "^8.20.0"
+  }
+}

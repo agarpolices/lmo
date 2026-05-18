@@ -1,0 +1,20 @@
+{
+  "amount": 1,
+  "amount_per_ip": 1,
+  "name": "bot",
+  "server": "s6",
+  "proxy": true,
+  "useacc": false,
+  "debugmode": true,
+  "battlemode": false,
+  "register": false,
+  "register_count": 100,
+  "register_threads": 3,
+  "puppeteer": false,
+  "proxy_mode": "v6",
+  "jitter": false,
+  "cloudflare": true,
+  "cf_cache": false,
+  "cf_concurrency": 60,
+  "cf_browsers": 1
+}

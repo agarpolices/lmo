@@ -1,0 +1,537 @@
+{
+  "timestamp": "2026-05-14T09:05:17.927Z",
+  "proxy": "207.148.112.16:30000",
+  "summary": {
+    "pass": 131,
+    "cf_block": 0,
+    "error": 0
+  },
+  "passing": [
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Win/Ch/136.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Win/Ch/135.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Win/Ch/134.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Mac/Ch/136.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Mac/Ch/135.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Lin/Ch/136.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_103"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_104"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_105"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_106"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_107"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_108"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_109"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_110"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_111"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_112"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_116_PSK"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_117"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_131"
+    },
+    {
+      "ua": "Lin/Ch/135.0.0.0",
+      "tls": "chrome_131_psk"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_102"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_104"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_105"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_106"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_108"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_110"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_117"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_120"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_123"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_132"
+    },
+    {
+      "ua": "Win/Fi/138.0",
+      "tls": "firefox_133"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_102"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_104"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_105"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_106"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_108"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_110"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_117"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_120"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_123"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_132"
+    },
+    {
+      "ua": "Mac/Fi/138.0",
+      "tls": "firefox_133"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_102"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_104"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_105"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_106"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_108"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_110"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_117"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_120"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_123"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_132"
+    },
+    {
+      "ua": "Lin/Fi/138.0",
+      "tls": "firefox_133"
+    }
+  ],
+  "blocked": [],
+  "errors": []
+}
