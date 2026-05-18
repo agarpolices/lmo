@@ -305,6 +305,7 @@ const cfScraper = {
     _ready: false,
     _launching: false,
     _robin: 0,
+    _retryTimers: [],   // Track pending retry setTimeout handles
 
     async init() {
         if (this._ready || this._launching || !config.cloudflare) return;
@@ -326,16 +327,22 @@ const cfScraper = {
             });
             this._browsers[idx] = browser;
             console.log(`  CF Browser #${idx + 1} launched`);
-            browser.on('disconnected', async () => {
+            browser.on('disconnected', () => {
                 console.log(`  CF Browser #${idx + 1} disconnected, relaunching...`);
                 this._browsers[idx] = null;
-                await new Promise(r => setTimeout(r, 2000));
-                await this._launchOne(idx);
+                const t = setTimeout(() => {
+                    this._retryTimers[idx] = null;
+                    this._launchOne(idx);
+                }, 2000);
+                this._retryTimers[idx] = t;
             });
         } catch (e) {
             console.log(`  CF Browser #${idx + 1} error: ${e.message}`);
-            await new Promise(r => setTimeout(r, 3000));
-            await this._launchOne(idx);
+            const t = setTimeout(() => {
+                this._retryTimers[idx] = null;
+                this._launchOne(idx);
+            }, 3000);
+            this._retryTimers[idx] = t;
         }
     },
 
@@ -403,7 +410,7 @@ const cfScraper = {
             };
 
             await context.close().catch(() => { });
-            return { cookies, headers };
+            return { cookies, headers, acceptLang };
         } catch (e) {
             await context.close().catch(() => { });
             throw e;
@@ -411,6 +418,10 @@ const cfScraper = {
     },
 
     async shutdown() {
+        // Clear all pending retry timers
+        for (let i = 0; i < this._retryTimers.length; i++) {
+            if (this._retryTimers[i]) { clearTimeout(this._retryTimers[i]); this._retryTimers[i] = null; }
+        }
         for (const b of this._browsers) {
             if (b) try { await b.close(); } catch (_) { }
         }
@@ -669,6 +680,7 @@ class Bot {
         // Store CF headers + cookies for reuse
         this._cfHeaders = res.headers || {};
         this._ua = res.headers?.['user-agent'] || this._ua;
+        this._acceptLang = res.acceptLang || res.headers?.['accept-language'] || this._acceptLang;
         this.cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
         this._cfCacheUsed = false;
 
@@ -797,8 +809,11 @@ class Bot {
 
     _onConnected(r) {
         if (config.debugmode) console.log('  ✓ Connected');
-        if (this.pool) this.pool._connected++;
-        this.alive = true;
+        // Only count once per socket lifecycle to prevent drift
+        if (!this.alive) {
+            if (this.pool) this.pool._connected++;
+            this.alive = true;
+        }
         if (r.buffer.byteLength === 1) {
             this.confirmed = true;
             this._sendAg219(0);
@@ -960,7 +975,7 @@ class RegisterBot extends Bot {
         if (next <= this.end) {
             setTimeout(() => {
                 const b = new RegisterBot('wss://s6.agma.io:2053/', this.tid, this.end, next, this.pool);
-                this.pool?.bots.push(b);
+                this.pool?.addBot(b);
             }, 500);
         } else { console.log(`  [Thread ${this.tid}] done.`); }
         this.pool?.remove(this);
@@ -973,7 +988,7 @@ const EventEmitter = require('events');
 class BotPool extends EventEmitter {
     constructor(accounts, opts = {}) {
         super();
-        this.bots = []; this._connected = 0; this._captcha = 0; this._regDone = 0;
+        this.bots = []; this._botSet = new Set(); this._connected = 0; this._captcha = 0; this._regDone = 0;
         this._randomNames = false; this.pos = { x: 0, y: 0 };
         this.accounts = accounts || null; this.captcha = new CaptchaService();
         this._statT = null; this._mouseT = null;
@@ -986,13 +1001,18 @@ class BotPool extends EventEmitter {
     }
     getStats() { return { connected: this._connected, total: this.bots.length, captcha: this._captcha }; }
 
+    addBot(bot) {
+        this.bots.push(bot);
+        this._botSet.add(bot);
+    }
+
     async create(n, url) {
         if (this.bots.length) this.disconnectAll();
 
         if (config.cloudflare) {
             // Phase 1: Create all bots without connecting
             for (let i = 0; i < n; i++) {
-                this.bots.push(new Bot(url, this.bots.length, this, false));
+                this.addBot(new Bot(url, this.bots.length, this, false));
             }
             // Pre-solve all CF sessions (cfScraper handles concurrency limiting)
             let solved = 0, failed = 0;
@@ -1004,6 +1024,8 @@ class BotPool extends EventEmitter {
                 )
             ));
             // Remove bots that failed CF
+            const failed_bots = this.bots.filter(b => !b._cfSolved);
+            for (const b of failed_bots) this._botSet.delete(b);
             this.bots = this.bots.filter(b => b._cfSolved);
             console.log(`  ✅ ${solved}/${n} CF sessions ready${failed ? `, ${failed} failed` : ''}. Connecting all...`);
             // Phase 2: Connect bots with staggered delay
@@ -1014,7 +1036,7 @@ class BotPool extends EventEmitter {
         } else {
             // No CF: original flow
             for (let i = 0; i < n; i++) {
-                this.bots.push(new Bot(url, this.bots.length, this));
+                this.addBot(new Bot(url, this.bots.length, this));
                 if (this.jitter) await new Promise(r => setTimeout(r, 150 + Math.random() * 250));
             }
         }
@@ -1036,7 +1058,12 @@ class BotPool extends EventEmitter {
         }
     }
 
-    remove(bot) { const i = this.bots.indexOf(bot); if (i !== -1) this.bots.splice(i, 1); }
+    remove(bot) {
+        if (!this._botSet.has(bot)) return;
+        this._botSet.delete(bot);
+        const i = this.bots.indexOf(bot);
+        if (i !== -1) this.bots.splice(i, 1);
+    }
 
     _cleanupZombies() {
         for (const b of this.bots) { if (b._retryT) { clearTimeout(b._retryT); b._retryT = null; } }
@@ -1048,6 +1075,7 @@ class BotPool extends EventEmitter {
     disconnectAll() {
         const snapshot = this.bots.slice(); // snapshot to avoid splice-while-iterating
         this.bots.length = 0;
+        this._botSet.clear();
         for (const b of snapshot) {
             if (b._retryT) { clearTimeout(b._retryT); b._retryT = null; }
             try { b.close(true, false); } catch (_) { }
@@ -1213,10 +1241,11 @@ function startServer() {
 
         pool.on('stats', stats => {
             if (ws.readyState !== WSServer.OPEN) return;
-            const b = Buffer.alloc(7);
-            b.writeUInt8(10, 0); b.writeUInt16LE(stats.connected, 1);
-            b.writeUInt16LE(stats.total, 3); b.writeUInt16LE(stats.captcha, 5);
-            ws.send(b);
+            // Per-connection buffer to avoid race if two pools emit in same tick
+            const statsBuf = Buffer.alloc(7);
+            statsBuf.writeUInt8(10, 0); statsBuf.writeUInt16LE(stats.connected, 1);
+            statsBuf.writeUInt16LE(stats.total, 3); statsBuf.writeUInt16LE(stats.captcha, 5);
+            ws.send(statsBuf);
         });
 
         log.ok(`Panel ${C.bold}#${id}${C.r} connected`);
@@ -1276,7 +1305,7 @@ async function main() {
         const s = t * per + 1, e = Math.min((t + 1) * per, total);
         if (s > total) break;
         regIdx[t] = s; log.info(`  [T${t}] ${s}–${e}`);
-        setTimeout(() => { const b = new RegisterBot('wss://s6.agma.io:2053/', t, e, s, pool); pool.bots.push(b); }, t * 3000);
+        setTimeout(() => { const b = new RegisterBot('wss://s6.agma.io:2053/', t, e, s, pool); pool.addBot(b); }, t * 3000);
     }
 }
 
