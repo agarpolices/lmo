@@ -315,6 +315,7 @@ const cfScraper = {
     _launching: false,
     _robin: 0,
     _launchRetries: [],
+    _retryTimers: [],
     _MAX_LAUNCH_RETRIES: 5,
 
     async init() {
@@ -347,13 +348,15 @@ const cfScraper = {
                 console.log(`  CF Browser #${idx + 1} disconnected, relaunching...`);
                 this._browsers[idx] = null;
                 this._launchRetries[idx]++;
-                setTimeout(() => this._launchOne(idx), 2000);
+                const t = setTimeout(() => { this._retryTimers[idx] = null; this._launchOne(idx); }, 2000);
+                this._retryTimers[idx] = t;
             });
         } catch (e) {
             console.log(`  CF Browser #${idx + 1} error: ${e.message}`);
             this._launchRetries[idx]++;
             const delay = Math.min(3000 * (2 ** (this._launchRetries[idx] - 1)), 30000);
-            setTimeout(() => this._launchOne(idx), delay);
+            const t = setTimeout(() => { this._retryTimers[idx] = null; this._launchOne(idx); }, delay);
+            this._retryTimers[idx] = t;
         }
     },
 
@@ -428,7 +431,7 @@ const cfScraper = {
             const ua = await page.evaluate(() => navigator.userAgent).catch(() => null);
             const headers = { 'user-agent': ua || '', 'accept-language': acceptLang };
             await context.close().catch(() => { });
-            return { cookies, headers };
+            return { cookies, headers, acceptLang };
         } catch (e) {
             await context.close().catch(() => { });
             throw e;
@@ -436,6 +439,7 @@ const cfScraper = {
     },
 
     async shutdown() {
+        for (let i = 0; i < this._retryTimers.length; i++) { if (this._retryTimers[i]) { clearTimeout(this._retryTimers[i]); this._retryTimers[i] = null; } }
         for (const b of this._browsers) {
             if (b) try { await b.close(); } catch (_) { }
         }
@@ -685,6 +689,7 @@ class Bot {
         const res = await cfScraper.solve('https://agma.io/client.php', proxy);
         this._cfHeaders = res.headers || {};
         this._ua = res.headers?.['user-agent'] || this._ua;
+        this._acceptLang = res.acceptLang || res.headers?.['accept-language'] || this._acceptLang;
         this.cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
         this._cfCacheUsed = false;
 
@@ -814,8 +819,7 @@ class Bot {
 
     _onConnected(r) {
         if (config.debugmode) console.log('  Connected #' + this.idx);
-        if (this.pool) this.pool._connected++;
-        this.alive = true;
+        if (!this.alive) { if (this.pool) this.pool._connected++; this.alive = true; }
         if (r.buffer.byteLength === 1) {
             this.confirmed = true;
             this._sendAg219(0);
@@ -979,7 +983,7 @@ class RegisterBot extends Bot {
         if (next <= this.end) {
             setTimeout(() => {
                 const b = new RegisterBot('wss://s6.agma.io:2053/', this.tid, this.end, next, this.pool);
-                this.pool?.bots.push(b);
+                this.pool?.addBot(b);
             }, 500);
         } else { console.log(`  [Thread ${this.tid}] done.`); }
         this.pool?.remove(this);
@@ -1236,10 +1240,6 @@ function startServer() {
     const app = express(); app.use(cors());
     const wss = new WSServer.Server({ noServer: true });
 
-    // Pre-allocate stats buffer (reused per send)
-    const statsBuf = Buffer.alloc(7);
-    statsBuf.writeUInt8(10, 0);
-
     wss.on('connection', ws => {
         const id = ++_sessionCounter;
         const accounts = new AccountStore();
@@ -1251,6 +1251,9 @@ function startServer() {
 
         pool.on('stats', stats => {
             if (ws.readyState !== WSServer.OPEN) return;
+            // Per-connection buffer to avoid race if two pools emit in same tick
+            const statsBuf = Buffer.alloc(7);
+            statsBuf.writeUInt8(10, 0);
             statsBuf.writeUInt16LE(stats.connected, 1);
             statsBuf.writeUInt16LE(stats.total, 3);
             statsBuf.writeUInt16LE(stats.captcha, 5);
@@ -1312,7 +1315,7 @@ async function main() {
         const s = t * per + 1, e = Math.min((t + 1) * per, total);
         if (s > total) break;
         regIdx[t] = s; log.info(`  [T${t}] ${s}-${e}`);
-        setTimeout(() => { const b = new RegisterBot('wss://s6.agma.io:2053/', t, e, s, pool); pool.bots.push(b); }, t * 3000);
+        setTimeout(() => { const b = new RegisterBot('wss://s6.agma.io:2053/', t, e, s, pool); pool.addBot(b); }, t * 3000);
     }
 }
 
