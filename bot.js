@@ -128,20 +128,36 @@ function createProxyPool() {
     return {
         list: [], set: new Set(), chunks: [], health: new Map(),
         QUARANTINE_MS: 60_000, MAX_FAIL: 5,
+        // Cached healthy snapshot — rebuilt at most once per CACHE_TTL ms.
+        // Without this, every forChunk() call re-scans the entire proxy list,
+        // which is hot during burst spawn (N bots × forChunk).
+        _healthyCache: null, _healthyAt: 0, _CACHE_TTL: 2000,
         add(p) {
             if (!p || this.set.has(p)) return;
             this.set.add(p); this.list.push(p);
             this.health.set(p, { ok: 0, fail: 0, until: 0 });
+            this._healthyCache = null;
         },
         ok(p) { const h = this.health.get(p); if (h) { h.ok++; h.fail = 0; } },
-        fail(p) { const h = this.health.get(p); if (h) { h.fail++; if (h.fail >= this.MAX_FAIL) h.until = Date.now() + this.QUARANTINE_MS; } },
+        fail(p) {
+            const h = this.health.get(p); if (h) {
+                h.fail++;
+                if (h.fail >= this.MAX_FAIL) { h.until = Date.now() + this.QUARANTINE_MS; this._healthyCache = null; }
+            }
+        },
         healthy(p) {
             const h = this.health.get(p); if (!h) return false;
             if (h.until > Date.now()) return false;
             if (h.until > 0) { h.fail = 0; h.until = 0; }
             return true;
         },
-        getHealthy() { return this.list.filter(p => this.healthy(p)); },
+        getHealthy() {
+            const now = Date.now();
+            if (this._healthyCache && now - this._healthyAt < this._CACHE_TTL) return this._healthyCache;
+            this._healthyCache = this.list.filter(p => this.healthy(p));
+            this._healthyAt = now;
+            return this._healthyCache;
+        },
         forChunk(i) {
             if (!this.list.length) return null;
             if (this.chunks[i] && this.healthy(this.chunks[i])) return this.chunks[i];
@@ -300,8 +316,14 @@ function decodeClientKey(raw) {
 }
 
 // ─── Inline CF Scraper (puppeteer-real-browser, multi-browser pool) ───────────
+// puppeteer-real-browser is ESM — load it once on init() instead of require()-ing
+// inside every _launchOne (cached require is cheap, but keeping a single handle
+// makes the relaunch path obviously safe).
+let _puppeteerRealBrowser = null;
+
 const cfScraper = {
-    _browsers: [],
+    _browsers: [],   // sparse: index → browser-or-null
+    _alive: [],      // dense: only currently-launched browsers (round-robin source)
     _ready: false,
     _launching: false,
     _robin: 0,
@@ -311,13 +333,14 @@ const cfScraper = {
         this._launching = true;
         const count = config.cf_browsers || 1;
         console.log(`  CF Scraper: launching ${count} browser(s)...`);
+        if (!_puppeteerRealBrowser) _puppeteerRealBrowser = require('puppeteer-real-browser');
         await Promise.all(Array.from({ length: count }, (_, i) => this._launchOne(i)));
         this._ready = true;
         this._launching = false;
     },
 
     async _launchOne(idx) {
-        const { connect } = require('puppeteer-real-browser');
+        const { connect } = _puppeteerRealBrowser || require('puppeteer-real-browser');
         try {
             const { browser } = await connect({
                 headless: false, turnstile: true,
@@ -325,10 +348,13 @@ const cfScraper = {
                 disableXvfb: false,
             });
             this._browsers[idx] = browser;
+            this._alive.push(browser);
             console.log(`  CF Browser #${idx + 1} launched`);
             browser.on('disconnected', async () => {
                 console.log(`  CF Browser #${idx + 1} disconnected, relaunching...`);
                 this._browsers[idx] = null;
+                const ai = this._alive.indexOf(browser);
+                if (ai !== -1) { this._alive[ai] = this._alive[this._alive.length - 1]; this._alive.pop(); }
                 await new Promise(r => setTimeout(r, 2000));
                 await this._launchOne(idx);
             });
@@ -340,28 +366,37 @@ const cfScraper = {
     },
 
     _pickBrowser() {
-        const available = this._browsers.filter(b => b);
-        if (!available.length) return null;
-        this._robin = (this._robin + 1) % available.length;
-        return available[this._robin];
+        const a = this._alive;
+        if (!a.length) return null;
+        // Round-robin without per-call array allocation
+        this._robin = (this._robin + 1) % a.length;
+        return a[this._robin];
     },
 
-    // Concurrency limiter
+    // Concurrency limiter — linked-list queue (O(1) enqueue/dequeue, no shift())
     _active: 0,
     get _maxConcurrent() { return config.cf_concurrency || 3; },
-    _queue: [],
+    _qHead: null, _qTail: null,
 
     async solve(url, proxy) {
-        // Wait in queue if at max concurrency
         if (this._active >= this._maxConcurrent) {
-            await new Promise(r => this._queue.push(r));
+            await new Promise(resolve => {
+                const node = { resolve, next: null };
+                if (this._qTail) { this._qTail.next = node; this._qTail = node; }
+                else { this._qHead = this._qTail = node; }
+            });
         }
         this._active++;
         try {
             return await this._doSolve(url, proxy);
         } finally {
             this._active--;
-            if (this._queue.length) this._queue.shift()();
+            const node = this._qHead;
+            if (node) {
+                this._qHead = node.next;
+                if (!this._qHead) this._qTail = null;
+                node.resolve();
+            }
         }
     },
 
@@ -417,9 +452,10 @@ const cfScraper = {
 
     async shutdown() {
         for (const b of this._browsers) {
-            if (b) try { await b.close(); } catch (_) { }
+            if (b) try { b.removeAllListeners('disconnected'); await b.close(); } catch (_) { }
         }
         this._browsers = [];
+        this._alive = [];
         this._ready = false;
     },
 };
@@ -429,49 +465,64 @@ const cfCache = {
     _file: 'data/cf-sessions.json',
     _data: {},
     _consumed: new Set(),
+    // Pre-built keys array + cursor for O(1) takeNext (was O(n) Object.keys per call)
+    _keys: [], _cursor: 0,
+    _count: 0,
     _dirty: false,
     _timer: null,
     async load() {
         try { this._data = JSON.parse(await fsp.readFile(this._file, 'utf8')); }
         catch (_) { this._data = {}; }
         this._consumed.clear();
+        this._keys = Object.keys(this._data);
+        this._cursor = 0;
+        this._count = this._keys.length;
     },
     get(proxyKey) { return this._data[proxyKey] || null; },
     set(proxyKey, session) {
+        const isNew = !(proxyKey in this._data);
         this._data[proxyKey] = { ...session, timestamp: Date.now() };
+        if (isNew) { this._keys.push(proxyKey); this._count++; }
         this._dirty = true;
         if (!this._timer) this._timer = setTimeout(() => this.flush(), 2000);
     },
     takeNext() {
-        for (const key of Object.keys(this._data)) {
-            if (!this._consumed.has(key)) {
-                this._consumed.add(key);
-                return { proxyRaw: key, ...this._data[key] };
-            }
+        // Skip already-consumed/deleted entries via the cursor — amortized O(1)
+        const keys = this._keys, consumed = this._consumed, data = this._data;
+        while (this._cursor < keys.length) {
+            const key = keys[this._cursor++];
+            if (!(key in data) || consumed.has(key)) continue;
+            consumed.add(key);
+            return { proxyRaw: key, ...data[key] };
         }
         return null;
     },
     consume(proxyKey) {
         this._consumed.delete(proxyKey);
-        if (this._data[proxyKey]) {
+        if (proxyKey in this._data) {
             delete this._data[proxyKey];
+            this._count--;
             this._dirty = true;
             if (!this._timer) this._timer = setTimeout(() => this.flush(), 2000);
         }
     },
     release(proxyKey) {
         // Return an unused entry back to the pool (un-reserve without deleting)
-        this._consumed.delete(proxyKey);
+        if (!this._consumed.delete(proxyKey)) return;
+        // Rewind cursor so a future takeNext can pick it up again
+        const idx = this._keys.indexOf(proxyKey);
+        if (idx !== -1 && idx < this._cursor) this._cursor = idx;
     },
-    get remaining() { return Object.keys(this._data).length - this._consumed.size; },
-    get count() { return Object.keys(this._data).length; },
+    get remaining() { return this._count - this._consumed.size; },
+    get count() { return this._count; },
     async flush() {
         if (!this._dirty) return;
         this._dirty = false;
         if (this._timer) { clearTimeout(this._timer); this._timer = null; }
         try {
             await fsp.mkdir(path.dirname(this._file), { recursive: true });
-            await fsp.writeFile(this._file + '.tmp', JSON.stringify(this._data, null, 2));
+            // Compact JSON — file is machine-only, no need to pretty-print
+            await fsp.writeFile(this._file + '.tmp', JSON.stringify(this._data));
             await fsp.rename(this._file + '.tmp', this._file);
         } catch (e) { this._dirty = true; }
     },
@@ -496,6 +547,13 @@ const { WebSocket } = require('wreq-js');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const crypto = require('crypto');
 
+// Lazy-loaded once; some configs never use SOCKS proxies
+let _SocksProxyAgent = null;
+function getSocksAgent() {
+    if (!_SocksProxyAgent) _SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent;
+    return _SocksProxyAgent;
+}
+
 class Bot {
     constructor(url, idx, pool, autoConnect = true) {
         this.idx = idx; this.pool = pool || null; this._retryT = null;
@@ -506,6 +564,9 @@ class Bot {
         this._ua = pickRandom(UA_POOL);
         this._acceptLang = pickRandom(ACCEPT_LANG_POOL);
         this.url = url;
+        // Cache the WS Host header once instead of new URL() per connect
+        try { this._wsHost = url ? new URL(url).host : 'agma.io'; }
+        catch (_) { this._wsHost = 'agma.io'; }
         if (autoConnect) this._connect(url);
     }
 
@@ -530,8 +591,8 @@ class Bot {
         const proto = this.protocol || 'http';
         const auth = this.username ? `${encodeURIComponent(this.username)}:${encodeURIComponent(this.password)}@` : '';
         if (proto === 'socks4' || proto === 'socks5') {
-            const { SocksProxyAgent } = require('socks-proxy-agent');
-            this.agent = new SocksProxyAgent(`${proto}://${auth}${this.host}:${this.port}`);
+            const SPA = getSocksAgent();
+            this.agent = new SPA(`${proto}://${auth}${this.host}:${this.port}`);
             this.proxyStr = `${proto}://${auth}${this.host}:${this.port}`;
         } else {
             this.agent = new HttpsProxyAgent(`http://${auth}${this.host}:${this.port}`);
@@ -585,7 +646,6 @@ class Bot {
                 return await res.text();
             }, body1);
             if (config.debugmode) console.log(`  [Debug] client.php response:`, r1Data);
-            console.log(this.proxyLogin)
             const m = String(r1Data).match(/(\d+)/);
             if (m) this.clientkey = parseInt(m[0], 10);
             this.clientkey = decodeClientKey(this.clientkey);
@@ -724,7 +784,7 @@ class Bot {
                 'Accept-Language': this._acceptLang,
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
-                'Host': (() => { try { return new URL(url).host; } catch { return 'agma.io'; } })(),
+                'Host': this._wsHost,
                 'Origin': 'https://agma.io',
                 'User-Agent': this._ua,
                 'Sec-Fetch-Site': 'same-site',
@@ -753,13 +813,24 @@ class Bot {
 
     // ── Messages ──
     _onMsg(msg) {
-        const r = new Reader(msg, 0);
-        if (r.buffer.getUint8(0) === OP.SRV_WRAPPER) r.position += 5;
-        const op = r.getUint8();
-        if (op === OP.SRV_CHALLENGE) this._onChallenge(r);
-        else if (op === OP.SRV_CONNECTED) this._onConnected(r);
-        else if (op === OP.SRV_CAPTCHA) { if (this.pool) this.pool._captcha++; }
-        else if (op === OP.SRV_ACCOUNT_RESULT) this._onAccResult(r);
+        // Guard against malformed/short frames — Reader throws RangeError on
+        // underflow, which would otherwise escape to uncaughtException and
+        // tear down the entire panel server.
+        try {
+            const r = new Reader(msg, 0);
+            if (r.buffer.byteLength < 1) return;
+            if (r.buffer.getUint8(0) === OP.SRV_WRAPPER) {
+                if (r.buffer.byteLength < 6) return;
+                r.position += 5;
+            }
+            const op = r.getUint8();
+            if (op === OP.SRV_CHALLENGE) this._onChallenge(r);
+            else if (op === OP.SRV_CONNECTED) this._onConnected(r);
+            else if (op === OP.SRV_CAPTCHA) { if (this.pool) this.pool._captcha++; }
+            else if (op === OP.SRV_ACCOUNT_RESULT) this._onAccResult(r);
+        } catch (e) {
+            if (config.debugmode) console.warn(`  WS msg parse #${this.idx}:`, e.message);
+        }
     }
 
     _onChallenge(r) {
@@ -802,10 +873,16 @@ class Bot {
 
     _onConnected(r) {
         if (config.debugmode) console.log('  ✓ Connected');
-        if (this.pool) this.pool._connected++;
-        this.alive = true;
+        // Guard against duplicate SRV_CONNECTED inflating the connected count
+        if (!this.alive) {
+            this.alive = true;
+            if (this.pool) this.pool._connected++;
+        }
         if (r.buffer.byteLength === 1) {
             this.confirmed = true;
+            // Track in the confirmed set so the mouse interval can iterate
+            // only confirmed bots instead of the entire pool every tick
+            if (this.pool?._confirmed) this.pool._confirmed.add(this);
             this._sendAg219(0);
             if (!config.debugmode && !config.register) {
                 this.send(PKT.S4_7_1); this.send(PKT.S4_8_0); this.send(PKT.S4_3_1);
@@ -907,6 +984,8 @@ class Bot {
         }
         if (this._retryT) { clearTimeout(this._retryT); this._retryT = null; }
         if (this.alive) { this.alive = false; if (this.pool) this.pool._connected = Math.max(0, this.pool._connected - 1); }
+        // Always drop from the confirmed set so the mouse interval skips us
+        if (this.pool?._confirmed) this.pool._confirmed.delete(this);
         if (this.socket) {
             this.socket.onopen = this.socket.onmessage = this.socket.onclose = this.socket.onerror = null;
             try { this.socket.close(); this._clearTimers(); } catch (_) { }
@@ -924,6 +1003,9 @@ class Bot {
         }
         if (err === false) this.reset();
         else if (remove && this.pool) this.pool.remove(this);
+        // Hard error path: drop from the pool so totals stay honest. Without this,
+        // failed bots accumulate as zombies (alive=false but still in pool.bots).
+        else if (err === true && this.pool) this.pool.remove(this);
     }
 }
 
@@ -965,7 +1047,7 @@ class RegisterBot extends Bot {
         if (next <= this.end) {
             setTimeout(() => {
                 const b = new RegisterBot('wss://s6.agma.io:2053/', this.tid, this.end, next, this.pool);
-                this.pool?.bots.push(b);
+                this.pool?.addBot(b);
             }, 500);
         } else { console.log(`  [Thread ${this.tid}] done.`); }
         this.pool?.remove(this);
@@ -988,14 +1070,20 @@ class BotPool extends EventEmitter {
         this._proxy = opts.proxy ?? (config.proxy_mode === 'v6' ? proxyV6 : proxyV4);
         this.name = opts.name ?? config.name;
         this.pelletLoop = false;
+        // O(1) membership for remove(); _confirmed is the hot-path subset that
+        // the mouse interval iterates (skip dead/unconfirmed bots).
+        this._botSet = new Set();
+        this._confirmed = new Set();
     }
     getStats() { return { connected: this._connected, total: this.bots.length, captcha: this._captcha }; }
+
+    addBot(bot) { this.bots.push(bot); this._botSet.add(bot); return bot; }
 
     async create(n, url) {
         if (this.bots.length) this.disconnectAll();
 
         if (config.cloudflare && config.cf_cache && cfCache.count > 0) {
-            // CF cache has entries → use cached sessions (single-use)
+            // CF cache has entries → use cached sessions (single-use), connect in parallel
             const available = Math.min(n, cfCache.remaining);
             if (available < n) {
                 log.warn(`CF cache: only ${cfCache.remaining} remaining, requested ${n}`);
@@ -1006,37 +1094,39 @@ class BotPool extends EventEmitter {
                 const bot = new Bot(url, this.bots.length, this, false);
                 bot._setProxy(entry.proxyRaw);
                 bot._applyCachedCfSession(entry);
-                this.bots.push(bot);
+                this.addBot(bot);
             }
             log.info(`Connecting ${this.bots.length} bots from CF cache (${cfCache.remaining} remaining)...`);
-            // Connect with staggered delay
-            for (const b of this.bots) {
-                b._connect(url);
-                await new Promise(r => setTimeout(r, 50 + Math.random() * 80));
-            }
+            // Fire connects in parallel — per-bot internal jitter (if enabled)
+            // already smears the WS handshake timing.
+            for (const b of this.bots) b._connect(url);
         } else if (config.cloudflare) {
-            // No cache → normal pre-solve flow (solve n, then connect n)
-            for (let i = 0; i < n; i++) {
-                this.bots.push(new Bot(url, this.bots.length, this, false));
-            }
+            // No cache → pipelined: connect each bot AS SOON AS its CF session resolves,
+            // overlapping later CF challenges with earlier WS handshakes. With
+            // cf_concurrency < n this is dramatically faster than the old
+            // "solve all → then connect all" two-phase flow.
+            const pending = [];
+            for (let i = 0; i < n; i++) pending.push(new Bot(url, i, this, false));
             let solved = 0, failed = 0;
-            console.log(`  ⏳ Pre-solving ${n} CF sessions (${cfScraper._maxConcurrent} concurrent)...`);
-            await Promise.allSettled(this.bots.map(b =>
+            console.log(`  ⏳ Solving CF + connecting (concurrency=${cfScraper._maxConcurrent})...`);
+            await Promise.allSettled(pending.map(b =>
                 b._fetchCfSession().then(
-                    () => { b._cfSolved = true; solved++; console.log(`  ✓ CF ${solved}/${n}`); },
+                    () => {
+                        b._cfSolved = true;
+                        solved++;
+                        this.addBot(b);
+                        if (solved % 10 === 0 || solved === n) console.log(`  ✓ CF ${solved}/${n}`);
+                        // Fire-and-forget: do not await — let other CF solves keep flowing
+                        b._connect(url);
+                    },
                     (e) => { failed++; if (config.debugmode) console.error(`  ✗ CF #${b.idx}:`, e.message); }
                 )
             ));
-            this.bots = this.bots.filter(b => b._cfSolved);
-            console.log(`  ✅ ${solved}/${n} CF sessions ready${failed ? `, ${failed} failed` : ''}. Connecting all...`);
-            for (const b of this.bots) {
-                b._connect(url);
-                await new Promise(r => setTimeout(r, 50 + Math.random() * 80));
-            }
+            console.log(`  ✅ ${solved}/${n} CF sessions ready${failed ? `, ${failed} failed` : ''}`);
         } else {
-            // No CF: original flow
+            // No CF: original spawn flow with optional inter-bot jitter
             for (let i = 0; i < n; i++) {
-                this.bots.push(new Bot(url, this.bots.length, this));
+                this.addBot(new Bot(url, this.bots.length, this));
                 if (this.jitter) await new Promise(r => setTimeout(r, 150 + Math.random() * 250));
             }
         }
@@ -1053,24 +1143,42 @@ class BotPool extends EventEmitter {
         }
         if (!this._mouseT) {
             this._mouseT = setInterval(() => {
-                for (let i = 0; i < this.bots.length; i++) this.bots[i].mouse(this.pos.x, this.pos.y);
+                // Iterate only confirmed bots — skips unconfirmed/dead bots that
+                // would otherwise pay the setInt32 writes for nothing.
+                const x = this.pos.x, y = this.pos.y;
+                for (const b of this._confirmed) b.mouse(x, y);
             }, 100);
         }
     }
 
-    remove(bot) { const i = this.bots.indexOf(bot); if (i !== -1) this.bots.splice(i, 1); }
+    remove(bot) {
+        if (!this._botSet.delete(bot)) return;
+        this._confirmed.delete(bot);
+        const i = this.bots.indexOf(bot);
+        if (i !== -1) {
+            // Swap-pop — O(1) instead of splice's O(n)
+            const last = this.bots.length - 1;
+            if (i !== last) this.bots[i] = this.bots[last];
+            this.bots.pop();
+        }
+    }
 
     _cleanupZombies() {
         for (const b of this.bots) { if (b._retryT) { clearTimeout(b._retryT); b._retryT = null; } }
         this.bots = this.bots.filter(b => b.alive);
-        this._connected = this.bots.filter(b => b.alive).length;
+        this._botSet = new Set(this.bots);
+        this._confirmed = new Set(this.bots.filter(b => b.confirmed));
+        this._connected = this.bots.length;
         this.emit('stats', this.getStats());
     }
 
     disconnectAll() {
-        const snapshot = this.bots.slice(); // snapshot to avoid splice-while-iterating
-        this.bots.length = 0;
-        for (const b of snapshot) {
+        const snapshot = this.bots; // bots is replaced atomically below
+        this.bots = [];
+        this._botSet = new Set();
+        this._confirmed = new Set();
+        for (let i = 0, len = snapshot.length; i < len; i++) {
+            const b = snapshot[i];
             if (b._retryT) { clearTimeout(b._retryT); b._retryT = null; }
             try { b.close(true, false); } catch (_) { }
         }
@@ -1342,12 +1450,25 @@ async function main() {
         const s = t * per + 1, e = Math.min((t + 1) * per, total);
         if (s > total) break;
         regIdx[t] = s; log.info(`  [T${t}] ${s}–${e}`);
-        setTimeout(() => { const b = new RegisterBot('wss://s6.agma.io:2053/', t, e, s, pool); pool.bots.push(b); }, t * 3000);
+        setTimeout(() => { const b = new RegisterBot('wss://s6.agma.io:2053/', t, e, s, pool); pool.addBot(b); }, t * 3000);
     }
 }
 
-process.on('SIGINT', async () => { dashboard.stop(); for (const s of dashboard.sessions.values()) s.pool.disconnectAll(); await cfCache.close(); await cfScraper.shutdown(); await closeTLS(); process.exit(0); });
-process.on('uncaughtException', async e => { dashboard.stop(); console.error('uncaught:', e.message); await cfCache.close(); await cfScraper.shutdown(); await closeTLS(); process.exit(1); });
-process.on('unhandledRejection', e => { /* swallow to avoid crashing server */ });
+async function _shutdown(code = 0) {
+    dashboard.stop();
+    for (const s of dashboard.sessions.values()) s.pool.disconnectAll();
+    await cfCache.close();
+    await cfScraper.shutdown();
+    await closeTLS();
+    process.exit(code);
+}
+
+process.on('SIGINT', () => _shutdown(0));
+process.on('SIGTERM', () => _shutdown(0));
+process.on('uncaughtException', e => { console.error('uncaught:', e.message); _shutdown(1); });
+process.on('unhandledRejection', e => {
+    if (config.debugmode) console.error('unhandledRejection:', e?.message || e);
+    // Otherwise swallow — we never want a stray promise rejection to kill the panel server
+});
 
 main();
