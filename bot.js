@@ -380,7 +380,12 @@ const cfScraper = {
                 await page.authenticate({ username: proxy.username, password: proxy.password });
             const acceptLang = pickRandom(ACCEPT_LANG_POOL);
 
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+            // CF challenge may redirect/abort the initial navigation — that's normal
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout }).catch(e => {
+                if (!e.message?.includes('ERR_ABORTED') && !e.message?.includes('net::ERR_')) {
+                    throw e;
+                }
+            });
 
             // Poll until cf_clearance cookie appears (means CF challenge was solved)
             const deadline = Date.now() + timeout;
@@ -423,11 +428,13 @@ const cfScraper = {
 const cfCache = {
     _file: 'data/cf-sessions.json',
     _data: {},
+    _consumed: new Set(),
     _dirty: false,
     _timer: null,
     async load() {
         try { this._data = JSON.parse(await fsp.readFile(this._file, 'utf8')); }
         catch (_) { this._data = {}; }
+        this._consumed.clear();
     },
     get(proxyKey) { return this._data[proxyKey] || null; },
     set(proxyKey, session) {
@@ -435,13 +442,28 @@ const cfCache = {
         this._dirty = true;
         if (!this._timer) this._timer = setTimeout(() => this.flush(), 2000);
     },
-    invalidate(proxyKey) {
+    takeNext() {
+        for (const key of Object.keys(this._data)) {
+            if (!this._consumed.has(key)) {
+                this._consumed.add(key);
+                return { proxyRaw: key, ...this._data[key] };
+            }
+        }
+        return null;
+    },
+    consume(proxyKey) {
+        this._consumed.delete(proxyKey);
         if (this._data[proxyKey]) {
             delete this._data[proxyKey];
             this._dirty = true;
             if (!this._timer) this._timer = setTimeout(() => this.flush(), 2000);
         }
     },
+    release(proxyKey) {
+        // Return an unused entry back to the pool (un-reserve without deleting)
+        this._consumed.delete(proxyKey);
+    },
+    get remaining() { return Object.keys(this._data).length - this._consumed.size; },
     get count() { return Object.keys(this._data).length; },
     async flush() {
         if (!this._dirty) return;
@@ -646,42 +668,24 @@ class Bot {
 
     // ── CF Clearance (inline — no separate service needed) ──
     async _fetchCfSession() {
-        // Check cache first
-        if (config.cf_cache && this._proxyRaw && !this._cfCacheInvalid) {
-            const cached = cfCache.get(this._proxyRaw);
-            if (cached) {
-                this._cfHeaders = cached.headers || {};
-                this._ua = cached.ua || this._ua;
-                this._acceptLang = cached.acceptLang || this._acceptLang;
-                this.cookieStr = cached.cookies || '';
-                this._cfCacheUsed = true;
-                if (config.debugmode) console.log(`  ✓ CF #${this.idx} (cached)`);
-                return;
-            }
-        }
-        this._cfCacheInvalid = false;
-
         const proxy = config.proxy && this.host ? {
             host: this.host, port: parseInt(this.port, 10),
             ...(this.username ? { username: this.username, password: this.password } : {}),
         } : undefined;
         const res = await cfScraper.solve('https://agma.io/client.php', proxy);
-        // Store CF headers + cookies for reuse
         this._cfHeaders = res.headers || {};
         this._ua = res.headers?.['user-agent'] || this._ua;
         this.cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
-        this._cfCacheUsed = false;
-
-        // Save to cache
-        if (config.cf_cache && this._proxyRaw) {
-            cfCache.set(this._proxyRaw, {
-                cookies: this.cookieStr,
-                headers: this._cfHeaders,
-                ua: this._ua,
-                acceptLang: this._acceptLang,
-            });
-        }
         if (config.debugmode) console.log(`  ✓ CF session #${this.idx} (${(res.cookies || []).length} cookies)`);
+    }
+
+    // Apply a cached CF session onto this bot
+    _applyCachedCfSession(entry) {
+        this._cfHeaders = entry.headers || {};
+        this._ua = entry.ua || this._ua;
+        this._acceptLang = entry.acceptLang || this._acceptLang;
+        this.cookieStr = entry.cookies || '';
+        this._cfSolved = true;
     }
 
     // ── Connect ──
@@ -702,6 +706,7 @@ class Bot {
             if (config.debugmode) console.error(`  ✗ TLS #${this.idx}:`, e.message);
             this.close(false, true); return;
         }
+        this._cfSessionUsed = true; // Mark: CF session was actually used for HTTP
         if (this._aborted) return;
         if (this.clientkey === 8 || this.clientkey === 0) { this.close(); return; }
 
@@ -894,11 +899,11 @@ class Bot {
     // ── Close ──
     close(remove, err) {
         this._aborted = true;
-        // Invalidate CF cache if connection failed with cached cookies
-        if (err && this._cfCacheUsed && config.cf_cache && this._proxyRaw) {
-            cfCache.invalidate(this._proxyRaw);
-            this._cfCacheInvalid = true;
-            this._cfCacheUsed = false;
+        // CF cache: consume if session was used, release if not
+        if (config.cf_cache && this._proxyRaw) {
+            if (this._cfSessionUsed) cfCache.consume(this._proxyRaw);
+            else cfCache.release(this._proxyRaw);
+            this._cfSessionUsed = false;
         }
         if (this._retryT) { clearTimeout(this._retryT); this._retryT = null; }
         if (this.alive) { this.alive = false; if (this.pool) this.pool._connected = Math.max(0, this.pool._connected - 1); }
@@ -989,12 +994,31 @@ class BotPool extends EventEmitter {
     async create(n, url) {
         if (this.bots.length) this.disconnectAll();
 
-        if (config.cloudflare) {
-            // Phase 1: Create all bots without connecting
+        if (config.cloudflare && config.cf_cache && cfCache.count > 0) {
+            // CF cache has entries → use cached sessions (single-use)
+            const available = Math.min(n, cfCache.remaining);
+            if (available < n) {
+                log.warn(`CF cache: only ${cfCache.remaining} remaining, requested ${n}`);
+            }
+            for (let i = 0; i < available; i++) {
+                const entry = cfCache.takeNext();
+                if (!entry) break;
+                const bot = new Bot(url, this.bots.length, this, false);
+                bot._setProxy(entry.proxyRaw);
+                bot._applyCachedCfSession(entry);
+                this.bots.push(bot);
+            }
+            log.info(`Connecting ${this.bots.length} bots from CF cache (${cfCache.remaining} remaining)...`);
+            // Connect with staggered delay
+            for (const b of this.bots) {
+                b._connect(url);
+                await new Promise(r => setTimeout(r, 50 + Math.random() * 80));
+            }
+        } else if (config.cloudflare) {
+            // No cache → normal pre-solve flow (solve n, then connect n)
             for (let i = 0; i < n; i++) {
                 this.bots.push(new Bot(url, this.bots.length, this, false));
             }
-            // Pre-solve all CF sessions (cfScraper handles concurrency limiting)
             let solved = 0, failed = 0;
             console.log(`  ⏳ Pre-solving ${n} CF sessions (${cfScraper._maxConcurrent} concurrent)...`);
             await Promise.allSettled(this.bots.map(b =>
@@ -1003,10 +1027,8 @@ class BotPool extends EventEmitter {
                     (e) => { failed++; if (config.debugmode) console.error(`  ✗ CF #${b.idx}:`, e.message); }
                 )
             ));
-            // Remove bots that failed CF
             this.bots = this.bots.filter(b => b._cfSolved);
             console.log(`  ✅ ${solved}/${n} CF sessions ready${failed ? `, ${failed} failed` : ''}. Connecting all...`);
-            // Phase 2: Connect bots with staggered delay
             for (const b of this.bots) {
                 b._connect(url);
                 await new Promise(r => setTimeout(r, 50 + Math.random() * 80));
@@ -1143,7 +1165,8 @@ const dashboard = {
         L.push('');
         L.push(`  ${C.bold}${C.cyan}\u2b21 AGMA BOT${C.r}  ${C.dim}${ts()}${C.r}`);
         L.push(`  ${C.gray}${'─'.repeat(54)}${C.r}`);
-        L.push(`  ${C.dim}Proxies${C.r}  v4: ${C.bold}${proxyV4.count}${C.r}  v6: ${C.bold}${proxyV6.count}${C.r}  ${C.dim}Port: ${config.server_port}${C.r}`);
+        const cfInfo = config.cf_cache ? `  ${C.dim}CF Cache: ${C.bold}${cfCache.remaining}${C.r}${C.dim} remaining${C.r}` : '';
+        L.push(`  ${C.dim}Proxies${C.r}  v4: ${C.bold}${proxyV4.count}${C.r}  v6: ${C.bold}${proxyV6.count}${C.r}${cfInfo}  ${C.dim}Port: ${config.server_port}${C.r}`);
         L.push('');
         if (!this.sessions.size) {
             L.push(`  ${C.dim}No active sessions — waiting for panel...${C.r}`);
@@ -1246,8 +1269,51 @@ async function main() {
 
     // Launch CF scraper browsers if cloudflare mode is enabled
     if (config.cloudflare) {
-        if (config.cf_cache) await cfCache.load();
-        await cfScraper.init();
+        if (config.cf_cache) {
+            await cfCache.load();
+            if (cfCache.count > 0) {
+                log.ok(`CF cache loaded: ${cfCache.count} sessions ready`);
+            } else {
+                // No cache → solve all proxies upfront, save, exit
+                await cfScraper.init();
+                const pool = config.proxy_mode === 'v6' ? proxyV6 : proxyV4;
+                const allProxies = pool.list;
+                if (!allProxies.length) { console.error('  ✗ No proxies loaded for CF solving'); process.exit(1); }
+                console.log(`  ⏳ Solving CF for all ${allProxies.length} proxies (${cfScraper._maxConcurrent} concurrent)...`);
+                let solved = 0, failed = 0;
+                const tasks = allProxies.map(proxyRaw => {
+                    const tmpBot = new Bot('', 0, null, false);
+                    tmpBot._setProxy(proxyRaw);
+                    return cfScraper.solve('https://agma.io/client.php', {
+                        host: tmpBot.host, port: parseInt(tmpBot.port, 10),
+                        ...(tmpBot.username ? { username: tmpBot.username, password: tmpBot.password } : {}),
+                    }).then(res => {
+                        const ua = res.headers?.['user-agent'] || tmpBot._ua;
+                        const cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+                        cfCache.set(proxyRaw, {
+                            cookies: cookieStr,
+                            headers: res.headers || {},
+                            ua,
+                            acceptLang: tmpBot._acceptLang,
+                        });
+                        solved++;
+                        console.log(`  ✓ CF ${solved}/${allProxies.length}`);
+                    }).catch(e => {
+                        failed++;
+                        if (config.debugmode) console.error(`  ✗ CF ${proxyRaw.split(':')[0]}:`, e.message);
+                    });
+                });
+                await Promise.allSettled(tasks);
+                await cfCache.flush();
+                console.log(`\n  ✅ Done! Solved ${solved}/${allProxies.length}${failed ? `, ${failed} failed` : ''}`);
+                console.log(`  📁 Saved to ${cfCache._file}`);
+                console.log(`  ▶  Run again to connect bots using cached sessions.\n`);
+                await cfScraper.shutdown();
+                process.exit(0);
+            }
+        } else {
+            await cfScraper.init();
+        }
     }
 
     if (!config.debugmode && !config.register) return startServer();
@@ -1280,7 +1346,7 @@ async function main() {
     }
 }
 
-process.on('SIGINT', async () => { dashboard.stop(); await cfCache.close(); await cfScraper.shutdown(); await closeTLS(); process.exit(0); });
+process.on('SIGINT', async () => { dashboard.stop(); for (const s of dashboard.sessions.values()) s.pool.disconnectAll(); await cfCache.close(); await cfScraper.shutdown(); await closeTLS(); process.exit(0); });
 process.on('uncaughtException', async e => { dashboard.stop(); console.error('uncaught:', e.message); await cfCache.close(); await cfScraper.shutdown(); await closeTLS(); process.exit(1); });
 process.on('unhandledRejection', e => { /* swallow to avoid crashing server */ });
 
