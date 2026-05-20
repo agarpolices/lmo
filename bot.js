@@ -18,6 +18,8 @@ const config = (() => {
         useacc: false, server_port: 8080, puppeteer: false, jitter: true,
         proxy_mode: 'v4', cloudflare: false,
         cf_timeout: 60000, cf_cache: false, cf_concurrency: 3, cf_browsers: 1,
+        cf_preflight: true, cf_preflight_timeout: 5000,
+        cf_background_refresh: false, cf_refresh_after_days: 5,
     };
     let raw = {};
     const cfgFile = ['data/config.json', 'config.json'].find(f => fs.existsSync(f));
@@ -239,6 +241,20 @@ const ACCEPT_LANG_POOL = [
 ];
 function pickRandom(arr) { return arr[~~(Math.random() * arr.length)]; }
 
+// Build sec-ch-ua / sec-ch-ua-mobile / sec-ch-ua-platform headers from a
+// captured `navigator.userAgentData` snapshot. Returns an empty object for
+// browsers that don't expose UA-CH (Firefox, older Chrome) — caller spreads
+// the result so absent fields just don't get emitted.
+function _buildSecChUa(uaData) {
+    if (!uaData?.brands?.length) return {};
+    const list = uaData.brands.map(b => `"${b.brand}";v="${b.version}"`).join(', ');
+    return {
+        'sec-ch-ua': list,
+        'sec-ch-ua-mobile': uaData.mobile ? '?1' : '?0',
+        'sec-ch-ua-platform': `"${uaData.platform || ''}"`,
+    };
+}
+
 class CaptchaService {
     constructor(key = config.capmonster_key) {
         this._c = CapMonsterCloudClientFactory.Create(new ClientOptions({ clientKey: key }));
@@ -287,9 +303,47 @@ const TLS_FIREFOX_IDS = [
     ClientIdentifier.firefox_123, ClientIdentifier.firefox_132,
     ClientIdentifier.firefox_133,
 ];
+// Version → ClientIdentifier maps. Used to pick a TLS fingerprint that matches
+// the *actual* browser version that solved CF, not a random one. Eliminates
+// the JA3 mismatch between solver-Chrome and node-tls-client.
+const TLS_CHROME_BY_VERSION = [
+    [103, ClientIdentifier.chrome_103], [104, ClientIdentifier.chrome_104],
+    [105, ClientIdentifier.chrome_105], [106, ClientIdentifier.chrome_106],
+    [107, ClientIdentifier.chrome_107], [108, ClientIdentifier.chrome_108],
+    [109, ClientIdentifier.chrome_109], [110, ClientIdentifier.chrome_110],
+    [111, ClientIdentifier.chrome_111], [112, ClientIdentifier.chrome_112],
+    [116, ClientIdentifier.chrome_116_PSK], [117, ClientIdentifier.chrome_117],
+    [131, ClientIdentifier.chrome_131_psk],
+];
+const TLS_FIREFOX_BY_VERSION = [
+    [102, ClientIdentifier.firefox_102], [104, ClientIdentifier.firefox_104],
+    [105, ClientIdentifier.firefox_105], [106, ClientIdentifier.firefox_106],
+    [108, ClientIdentifier.firefox_108], [110, ClientIdentifier.firefox_110],
+    [117, ClientIdentifier.firefox_117], [120, ClientIdentifier.firefox_120],
+    [123, ClientIdentifier.firefox_123], [132, ClientIdentifier.firefox_132],
+    [133, ClientIdentifier.firefox_133],
+];
+function _pickClosestId(map, version) {
+    // Highest entry <= version. If version is below the oldest entry, fall
+    // back to the oldest (closest stand-in); if it exceeds the newest, the
+    // loop naturally settles on the newest. Picking newer-than-target would
+    // emit a JA3 from a fingerprint Chrome wasn't capable of yet.
+    let best = map[0][1];
+    for (const [v, id] of map) {
+        if (v <= version) best = id;
+        else break;
+    }
+    return best;
+}
 function pickTLSIdentifier(ua) {
-    if (ua.includes('Firefox')) return pickRandom(TLS_FIREFOX_IDS);
-    return pickRandom(TLS_CHROME_IDS);
+    const isFirefox = ua.includes('Firefox');
+    const m = ua.match(/(?:Chrome|Firefox)\/(\d+)/);
+    if (m) {
+        const v = parseInt(m[1], 10);
+        return _pickClosestId(isFirefox ? TLS_FIREFOX_BY_VERSION : TLS_CHROME_BY_VERSION, v);
+    }
+    // No version parsed — fall back to random (matches old behavior)
+    return pickRandom(isFirefox ? TLS_FIREFOX_IDS : TLS_CHROME_IDS);
 }
 
 async function createTLSSession(ua) {
@@ -325,18 +379,22 @@ const cfScraper = {
     _browsers: [],   // sparse: index → browser-or-null
     _alive: [],      // dense: only currently-launched browsers (round-robin source)
     _ready: false,
-    _launching: false,
+    _launchPromise: null,  // shared promise so concurrent init() calls coalesce
     _robin: 0,
 
     async init() {
-        if (this._ready || this._launching || !config.cloudflare) return;
-        this._launching = true;
-        const count = config.cf_browsers || 1;
-        console.log(`  CF Scraper: launching ${count} browser(s)...`);
-        if (!_puppeteerRealBrowser) _puppeteerRealBrowser = require('puppeteer-real-browser');
-        await Promise.all(Array.from({ length: count }, (_, i) => this._launchOne(i)));
-        this._ready = true;
-        this._launching = false;
+        if (this._ready) return;
+        if (this._launchPromise) return this._launchPromise;
+        if (!config.cloudflare) return;
+        this._launchPromise = (async () => {
+            const count = config.cf_browsers || 1;
+            console.log(`  CF Scraper: launching ${count} browser(s)...`);
+            if (!_puppeteerRealBrowser) _puppeteerRealBrowser = require('puppeteer-real-browser');
+            await Promise.all(Array.from({ length: count }, (_, i) => this._launchOne(i)));
+            this._ready = true;
+        })();
+        try { await this._launchPromise; }
+        finally { this._launchPromise = null; }
     },
 
     async _launchOne(idx) {
@@ -401,6 +459,13 @@ const cfScraper = {
     },
 
     async _doSolve(url, proxy) {
+        // Pre-flight: cheap probe to fail-fast on dead proxies before paying
+        // 1-2s context-creation + up-to-60s CF-wait.
+        if (config.cf_preflight && proxy) {
+            const ok = await this._preflightProxy(proxy);
+            if (!ok) throw new Error('CF scraper: proxy pre-flight failed');
+        }
+
         const browser = this._pickBrowser();
         if (!browser) throw new Error('CF scraper: no browser available');
         const timeout = config.cf_timeout || 60000;
@@ -422,32 +487,71 @@ const cfScraper = {
                 }
             });
 
-            // Poll until cf_clearance cookie appears (means CF challenge was solved)
+            // Poll until cf_clearance appears. cf_clearance is HttpOnly so we
+            // can't shortcut via page.waitForFunction(document.cookie); we keep
+            // page.cookies() polling but at 100ms instead of 500ms — drops up to
+            // ~400ms of tail latency per solve at negligible CDP cost.
             const deadline = Date.now() + timeout;
             let cookies = [];
             while (Date.now() < deadline) {
                 cookies = await page.cookies();
                 if (cookies.some(c => c.name === 'cf_clearance')) break;
-                await new Promise(r => setTimeout(r, 500));
+                await new Promise(r => setTimeout(r, 100));
             }
 
             if (!cookies.some(c => c.name === 'cf_clearance')) {
                 throw new Error('CF scraper: cf_clearance cookie never appeared');
             }
 
-            // Grab the UA from the page itself (matches what CF saw)
-            const ua = await page.evaluate(() => navigator.userAgent).catch(() => null);
+            // Capture the full fingerprint that CF actually saw. The clearance
+            // is bound to (IP, UA, JA3-ish); replaying the matching UA + Client
+            // Hints keeps subsequent requests on the same fingerprint and
+            // lowers the re-challenge rate when the bot switches from
+            // puppeteer-real-browser → node-tls-client → wreq-js WS.
+            const fp = await page.evaluate(() => {
+                const ud = navigator.userAgentData;
+                return {
+                    ua: navigator.userAgent,
+                    uaData: ud ? { brands: ud.brands, mobile: ud.mobile, platform: ud.platform } : null,
+                };
+            }).catch(() => ({ ua: '', uaData: null }));
+            const ua = fp.ua || '';
+            const secChUa = _buildSecChUa(fp.uaData);
             const headers = {
-                'user-agent': ua || '',
+                'user-agent': ua,
                 'accept-language': acceptLang,
+                ...secChUa,
             };
 
             await context.close().catch(() => { });
-            return { cookies, headers };
+            return { cookies, headers, ua, acceptLang, secChUa };
         } catch (e) {
             await context.close().catch(() => { });
             throw e;
         }
+    },
+
+    // Lightweight probe to fail-fast on dead proxies before committing to the
+    // full CF-solve cost. Uses Cloudflare's own /cdn-cgi/trace which is plain
+    // text, fast, and routed for both v4 and v6.
+    async _preflightProxy(proxy) {
+        if (!proxy) return true;
+        const https = require('https');
+        const auth = proxy.username
+            ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`
+            : '';
+        const agent = new HttpsProxyAgent(`http://${auth}${proxy.host}:${proxy.port}`);
+        const timeout = config.cf_preflight_timeout || 5000;
+        return await new Promise(resolve => {
+            const req = https.request('https://1.1.1.1/cdn-cgi/trace', { method: 'GET', agent }, res => {
+                res.on('data', () => { });
+                res.on('end', () => resolve(res.statusCode === 200));
+                res.on('error', () => resolve(false));
+            });
+            req.on('error', () => resolve(false));
+            req.setTimeout(timeout, () => { req.destroy(); resolve(false); });
+            req.end();
+        });
     },
 
     async shutdown() {
@@ -512,6 +616,40 @@ const cfCache = {
         // Rewind cursor so a future takeNext can pick it up again
         const idx = this._keys.indexOf(proxyKey);
         if (idx !== -1 && idx < this._cursor) this._cursor = idx;
+    },
+    // Background refresh: re-solve a single proxy and overwrite its cache entry
+    // without blocking the caller. No-op if a refresh is already in flight for
+    // this key. Lazy-inits the scraper if needed (which is why init() must be
+    // idempotent — many bots may pull a stale entry within the same tick).
+    _refreshing: new Set(),
+    requestRefresh(proxyRaw) {
+        if (!proxyRaw || this._refreshing.has(proxyRaw)) return;
+        this._refreshing.add(proxyRaw);
+        (async () => {
+            try {
+                if (!cfScraper._ready) await cfScraper.init();
+                if (!cfScraper._ready) return; // init no-op'd (e.g. cloudflare:false)
+                const px = parseProxy(proxyRaw);
+                const proxy = {
+                    host: px.host, port: parseInt(px.port, 10),
+                    ...(px.username ? { username: px.username, password: px.password } : {}),
+                };
+                const res = await cfScraper.solve('https://agma.io/', proxy);
+                const cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+                this.set(proxyRaw, {
+                    cookies: cookieStr,
+                    headers: res.headers || {},
+                    ua: res.ua || '',
+                    acceptLang: res.acceptLang || '',
+                    secChUa: res.secChUa || {},
+                });
+                if (config.debugmode) console.log(`  ↻ CF refreshed: ${proxyRaw}`);
+            } catch (_) {
+                // Leave the existing entry in place — stale > missing
+            } finally {
+                this._refreshing.delete(proxyRaw);
+            }
+        })();
     },
     get remaining() { return this._count - this._consumed.size; },
     get count() { return this._count; },
@@ -686,10 +824,12 @@ class Bot {
             : undefined;
         const baseOpts = {
             headers: {
+                ...(this._secChUa || {}),
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Origin': 'https://agma.io',
                 'Referer': 'https://agma.io/',
                 'User-Agent': this._ua,
+                'Accept-Language': this._acceptLang,
                 ...(this.cookieStr ? { 'Cookie': this.cookieStr } : {}),
             },
             ...(proxyUrl ? { proxy: proxyUrl } : {}),
@@ -732,11 +872,23 @@ class Bot {
             host: this.host, port: parseInt(this.port, 10),
             ...(this.username ? { username: this.username, password: this.password } : {}),
         } : undefined;
-        const res = await cfScraper.solve('https://agma.io/client.php', proxy);
-        this._cfHeaders = res.headers || {};
-        this._ua = res.headers?.['user-agent'] || this._ua;
-        this.cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
-        if (config.debugmode) console.log(`  ✓ CF session #${this.idx} (${(res.cookies || []).length} cookies)`);
+        const proxyPool = this.pool?._proxy;
+        try {
+            const res = await cfScraper.solve('https://agma.io/', proxy);
+            this._cfHeaders = res.headers || {};
+            this._ua = res.ua || res.headers?.['user-agent'] || this._ua;
+            this._acceptLang = res.acceptLang || this._acceptLang;
+            this._secChUa = res.secChUa || {};
+            this.cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+            if (this._proxyRaw) proxyPool?.ok?.(this._proxyRaw);
+            if (config.debugmode) console.log(`  ✓ CF session #${this.idx} (${(res.cookies || []).length} cookies)`);
+        } catch (e) {
+            // Feed CF-solve failures into proxy quarantine so a CF-blocked IP
+            // is skipped on subsequent forChunk() calls instead of being
+            // hammered until h.fail crosses the HTTP/WS-driven threshold.
+            if (this._proxyRaw) proxyPool?.fail?.(this._proxyRaw);
+            throw e;
+        }
     }
 
     // Apply a cached CF session onto this bot
@@ -744,8 +896,17 @@ class Bot {
         this._cfHeaders = entry.headers || {};
         this._ua = entry.ua || this._ua;
         this._acceptLang = entry.acceptLang || this._acceptLang;
+        this._secChUa = entry.secChUa || {};
         this.cookieStr = entry.cookies || '';
         this._cfSolved = true;
+        // Non-blocking refresh if this entry is older than the threshold. The
+        // bot uses the still-valid cookie immediately; the cache file gets
+        // updated whenever the scraper finishes. Opt-in via cf_background_refresh.
+        if (config.cf_background_refresh && entry.timestamp && this._proxyRaw) {
+            const ageMs = Date.now() - entry.timestamp;
+            const thresholdMs = (config.cf_refresh_after_days || 5) * 86400_000;
+            if (ageMs > thresholdMs) cfCache.requestRefresh(this._proxyRaw);
+        }
     }
 
     // ── Connect ──
@@ -780,6 +941,7 @@ class Bot {
 
         this.socket = new WebSocket(url, {
             headers: {
+                ...(this._secChUa || {}),
                 'Accept-Encoding': 'gzip, deflate, br, zstd',
                 'Accept-Language': this._acceptLang,
                 'Cache-Control': 'no-cache',
@@ -1392,22 +1554,23 @@ async function main() {
                 const tasks = allProxies.map(proxyRaw => {
                     const tmpBot = new Bot('', 0, null, false);
                     tmpBot._setProxy(proxyRaw);
-                    return cfScraper.solve('https://agma.io/client.php', {
+                    return cfScraper.solve('https://agma.io/', {
                         host: tmpBot.host, port: parseInt(tmpBot.port, 10),
                         ...(tmpBot.username ? { username: tmpBot.username, password: tmpBot.password } : {}),
                     }).then(res => {
-                        const ua = res.headers?.['user-agent'] || tmpBot._ua;
                         const cookieStr = (res.cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
                         cfCache.set(proxyRaw, {
                             cookies: cookieStr,
                             headers: res.headers || {},
-                            ua,
-                            acceptLang: tmpBot._acceptLang,
+                            ua: res.ua || tmpBot._ua,
+                            acceptLang: res.acceptLang || tmpBot._acceptLang,
+                            secChUa: res.secChUa || {},
                         });
                         solved++;
                         console.log(`  ✓ CF ${solved}/${allProxies.length}`);
                     }).catch(e => {
                         failed++;
+                        pool.fail(proxyRaw);
                         if (config.debugmode) console.error(`  ✗ CF ${proxyRaw.split(':')[0]}:`, e.message);
                     });
                 });

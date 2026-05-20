@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **CF fingerprint passthrough** — `cfScraper` now captures `navigator.userAgentData` and emits matching `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform` headers on the subsequent HTTP exchange and WebSocket handshake. Lowers re-challenge rate from CF's WAF when bots switch from puppeteer-real-browser → node-tls-client → wreq-js WS.
+- **Version-aware TLS identifier picker** — `pickTLSIdentifier(ua)` now parses the Chrome/Firefox major version out of the captured UA and selects the closest available `ClientIdentifier`, instead of picking randomly. Eliminates the JA3 mismatch between solver-Chrome and post-clearance HTTP.
+- **Pre-flight proxy probe** (`cf_preflight`, default `true`) — 5s probe against `https://1.1.1.1/cdn-cgi/trace` before paying the 1–2s context-creation + up-to-60s CF-wait cost. Drops mean failed-solve latency from ~60s to <5s on dead proxies.
+- **Background CF cache refresh** (`cf_background_refresh`, default `false`; `cf_refresh_after_days`, default `5`) — when a bot pulls a cached session older than the threshold, a non-blocking re-solve overwrites the cache entry while the bot uses the still-valid cookie immediately.
+- **CF solve failures feed proxy quarantine** — `Bot._fetchCfSession` and the precache loop in `main()` now call `proxyPool.fail(raw)` on solve failure, so a CF-blacklisted IP is skipped on subsequent `forChunk()` calls instead of being hammered until the HTTP/WS-driven failure threshold is reached.
+
+### Changed
+- **CF solve URL** is now `https://agma.io/` instead of `https://agma.io/client.php`. Same zone, same clearance scope, but a GET to a POST endpoint is anomalous to CF; the root path looks like normal browser traffic.
+- **Cookie-wait polling interval** in `cfScraper._doSolve` shrunk from 500ms → 100ms. `cf_clearance` is HttpOnly so we can't shortcut via `page.waitForFunction(document.cookie)`; this is the cheap version of the same idea. Drops up to ~400ms tail latency per solve.
+- **`cfScraper.init()` is now idempotent** — concurrent callers (e.g. multiple background-refresh requests) coalesce on a single shared promise instead of racing.
+
+### Configuration
+New keys (all backward-compatible defaults):
+- `cf_preflight: true`
+- `cf_preflight_timeout: 5000`
+- `cf_background_refresh: false`
+- `cf_refresh_after_days: 5`
+
 ## [2.0.0] — 2026-04-20
 
 ### Breaking Changes
